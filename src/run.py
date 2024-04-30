@@ -52,7 +52,65 @@ def calculatePerplexity_gpt3(prompt, modelname):
     p1 = np.exp(-np.mean(all_prob))
     return p1, all_prob, np.mean(all_prob)
 
-     
+
+token_lens = [0, 1, 3, 5, 10, 20, 30]
+
+@torch.no_grad()
+def calculateInfillPerplexity(sentence, model, tokenizer, gpu):
+    input_ids = torch.tensor(tokenizer.encode(sentence)).unsqueeze(0)
+    input_ids = input_ids.to(gpu)
+
+    logits = model(input_ids=input_ids, labels=input_ids).logits
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    mu = (probabilities[0] * log_probs[0]).sum(-1)
+    sigma = ((probabilities[0]) * torch.square(log_probs[0])).sum(-1) - torch.square(mu)
+
+    all_ratios = {}
+    for token_len in token_lens:
+        all_ratios[token_len] = []
+
+    token_count = input_ids.shape[-1]
+    for i in range(token_count-1):
+
+        # top p(w2 | w1)
+        top_k_probs = torch.sort(probs[:, i, :], dim=-1, descending=True)
+
+        w2 = input_ids[:, i+1]
+        w2_opt = top_k_probs.indices[:, 0]
+
+        if w2 != w2_opt:
+            input_tokens_i = copy.deepcopy(input_ids)
+            input_tokens_i[:, i+1] = w2_opt
+
+            logits_opt = model(input_ids = input_tokens_i, labels = input_tokens_i).logits
+            probs_opt = torch.nn.functional.softmax(logits_opt, dim=-1)
+            log_probs_opt = torch.nn.functional.log_softmax(logits2, dim=-1)
+
+            mu_2 = (probs_opt[0] * log_probs2[0]).sum(-1)
+            sigma_2 = ((probs_opt[0]) * torch.square(log_probs2[0])).sum(-1) - torch.square(mu)
+
+            # w1 w2_training w3, w1 w2_most_likely w3
+            # ratio = p(w2_training | w1 w3) / p(w2_most_likely | w1 w3)
+            ratios = {}
+
+            for token_len in token_lens:
+                ratios[token_len] = ((log_probs[:, i, w2] - mu[i]) / sigma[i].sqrt()) - ((log_probs_opt[:, i, w2_likely] - mu_2[i]) / sigma_2[i].sqrt()) 
+
+            for token_len in token_lens:
+                for j in range(i, min(i+token_len, token_count-3)):
+                    w_j = input_ids[:, j+2]
+                    r =  ((log_probs[:, j+1, w_j] - mu[i]) / sigma[i].sqrt()) - ((log_probs_opt[:, j+1, w_j] - mu_2[i]) / sigma_2[i].sqrt())
+                    ratios[token_len] = ratios[token_len] + r
+                all_ratios[token_len].append(ratios[token_len].item())
+        else:
+            for token_len in token_lens:
+                all_ratios[token_len].append(0.)
+        
+    return all_ratios
+
+
 def calculatePerplexity(sentence, model, tokenizer, gpu):
     """
     exp(loss)
@@ -108,6 +166,18 @@ def inference(model1, model2, tokenizer1, tokenizer2, text, ex, modelname1, mode
         k_length = int(len(all_prob)*ratio)
         topk_prob = np.sort(all_prob)[:k_length]
         pred[f"Min_{ratio*100}% Prob"] = -np.mean(topk_prob).item()
+
+    ## ours: InfillMIA
+    infill_probs = calculateInfillPerplexity(text, model, tokenizer, model.device)
+
+    for token_ind in infill_probs:
+        infill_prob = infill_probs[token_ind]
+        infill_prob = np.nan_to_num(infill_prob)
+
+        for ratio in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+            k_length = int(len(infill_prob) * ratio)
+            topk = np.sort(infill_prob)[:k_length]
+            pred[f'InfillMIA_{token_ind}tokens_{ratio*100}% Prob'].append(-np.mean(topk).item())
 
     ex["pred"] = pred
     return ex
